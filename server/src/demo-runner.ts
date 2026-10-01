@@ -1,0 +1,162 @@
+// "Run demo": load a demo project and let its simulated team (real MCP clients, see sim/) work it
+// inside this server process. Finished tasks unlock the next ones automatically; a senior or the PM
+// approves the finished milestone in the UI. The run stops when every scripted task is done, at the time limit, or on Stop.
+import fs from "node:fs";
+import path from "node:path";
+import type { DB } from "./db.js";
+import { reset } from "./seed.js";
+import { DEFAULT_PROJECT, validateProject } from "./project-file.js";
+import { runSim, loadStories } from "../sim/sim.js";
+import { BadRequest, HttpError } from "./permissions.js";
+
+const PROJECTS_DIR = path.dirname(DEFAULT_PROJECT);
+const MAX_RUN_MS = 15 * 60_000;
+const MAX_RUN_REAL_MS = 60 * 60_000;   // real agents take longer than the simulator
+const LOG_LINES = 40;
+
+type Run = {
+  project: string; file: string; startedAt: string; finishedAt: string | null; endReason: string | null;
+  cast: string[]; real: string[]; taskIds: string[]; log: string[]; stop: AbortController | null; watcher: NodeJS.Timeout | null;
+};
+let current: Run | null = null;
+
+/** Demo projects = project files that have simulator stories. Read once: the files ship with the server. */
+let projectsCache: string[] | null = null;
+export function demoProjects() {
+  return projectsCache ??= fs.readdirSync(PROJECTS_DIR).filter(f => f.endsWith(".json")).map(f => f.replace(/\.json$/, ""))
+    .filter(name => Object.keys(loadStories(path.join(PROJECTS_DIR, `${name}.json`))).length > 0).sort();
+}
+
+function finish(reason: string) {
+  if (!current || current.finishedAt) return;
+  current.finishedAt = new Date().toISOString();
+  current.endReason = reason;
+  current.log.push(`Demo ended: ${reason}`);
+  if (current.watcher) clearInterval(current.watcher);
+  current.stop?.abort();
+}
+
+/** Who works a demo project's scripted tasks (first worker of each task that has a story). */
+const castCache = new Map<string, ReturnType<typeof readCast>>();
+/** Cached: project files ship with the server and status is polled every 2 s. */
+function castOf(project: string) {
+  if (!castCache.has(project)) castCache.set(project, readCast(project));
+  return castCache.get(project)!;
+}
+function readCast(project: string) {
+  const file = path.join(PROJECTS_DIR, `${project}.json`);
+  const stories = loadStories(file);
+  const spec = validateProject(JSON.parse(fs.readFileSync(file, "utf8")));
+  const storyTasks = spec.tasks.filter(t => stories[t.id]);
+  const cast = [...new Set(storyTasks.map(t => t.workers[0]).filter(Boolean))];
+  return { file, spec, taskIds: storyTasks.map(t => t.id), cast };
+}
+
+/**
+ * opts.real: people whose own agents (e.g. Claude Code over MCP) work their tasks live; the simulator
+ * leaves those tasks alone and plays everyone else.
+ */
+export function startDemo(db: DB, selfUrl: string, opts: { project?: string; speed?: number; real?: string[] } = {}) {
+  if (current && !current.finishedAt) throw new HttpError(409, "A demo is already running. Stop it first.");
+  const project = opts.project ?? "lumen";
+  if (!/^[a-z0-9-]+$/.test(project) || !demoProjects().includes(project))
+    throw new BadRequest(`Unknown demo project "${project}". Available: ${demoProjects().join(", ")}`);
+  const speed = Math.min(Math.max(Number(opts.speed ?? 1) || 0, 0), 5);
+  const { file, spec, taskIds, cast } = castOf(project);
+  if (!taskIds.length || !cast.length) throw new BadRequest(`Demo project "${project}" has no simulator stories that match its tasks`);
+  const real = [...new Set(Array.isArray(opts.real) ? opts.real.map(String) : [])];
+  const unknown = real.filter(id => !cast.includes(id));
+  if (unknown.length) throw new BadRequest(`Not in the demo cast: ${unknown.join(", ")}. Cast: ${cast.join(", ")}`);
+  // A real person's first scripted task is theirs to do live; the simulator covers their later tasks once
+  // it is done, so the milestone can still finish and be approved on camera.
+  const handsOff = real.map(id => spec.tasks.find(t => taskIds.includes(t.id) && t.workers[0] === id)!.id);
+
+  reset(db, file);
+  const stop = new AbortController();
+  const run: Run = { project, file, startedAt: new Date().toISOString(), finishedAt: null, endReason: null, cast, real, taskIds, log: [], stop, watcher: null };
+  current = run;
+  const log = (line: string) => { run.log.push(line); if (run.log.length > LOG_LINES) run.log.shift(); };
+
+  if (real.length) log(`Real agents: ${real.join(", ")}. Waiting for their own agents on ${handsOff.join(", ")}.`);
+  // Agents re-check for newly unlocked work every 3 s, so finished prerequisites are picked up almost immediately.
+  // Shared by both simulator runs: with real agents, a started task the simulator didn't start is theirs.
+  const claimed = real.length ? new Set(spec.tasks.filter(t => t.status === "in_progress" && !handsOff.includes(t.id)).map(t => t.id)) : undefined;
+  const sim = (people: string[]) => runSim({ baseUrl: selfUrl, projectFile: file, people, drivers: cast, handsOff, claimed, speed, loop: true, heartbeatMs: speed === 0 ? 50 : 3000, signal: stop.signal, log })
+    .then(r => log(`Agents went offline (${r.submitted} task(s) completed).`))
+    .catch(e => { log(`Simulator error: ${(e as Error).message}`); if (current === run) finish("error"); });
+  const simulated = cast.filter(id => !real.includes(id));
+  if (simulated.length) void sim(simulated);
+  // A real person's stand-in only comes online after their live task is done, so it never shows up
+  // in the live view (or heartbeats as them) while their real agent is working.
+  let standInsStarted = real.length === 0;
+
+  run.watcher = setInterval(() => {
+    if (current !== run) return;
+    try {
+      if (!standInsStarted && handsOff.every(id => (db.prepare("SELECT status FROM tasks WHERE id=?").get(id) as { status: string } | undefined)?.status === "done")) {
+        standInsStarted = true;
+        log(`${real.join(", ")} finished ${handsOff.join(", ")} live; the simulator takes over their remaining tasks.`);
+        void sim(real);
+      }
+      const open = (db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE status != 'done' AND id IN (${taskIds.map(() => "?").join(",")})`).get(...taskIds) as { n: number }).n;
+      if (open === 0) finish("complete: every task is done");
+      else if (Date.now() - Date.parse(run.startedAt) > (run.real.length ? MAX_RUN_REAL_MS : MAX_RUN_MS)) finish(`time limit (${run.real.length ? 60 : 15} min)`);
+    } catch (e) {
+      // A timer error must never take the server down; end the run instead.
+      log(`Progress check failed: ${(e as Error).message}`);
+      finish("error");
+    }
+  }, 2000);
+  run.watcher.unref?.();
+  return demoStatus(db);
+}
+
+/** Project files that can be loaded (Northwind, Lumen, …); test fixtures are left out. */
+export function loadableProjects() {
+  return fs.readdirSync(PROJECTS_DIR).filter(f => f.endsWith(".json") && !f.includes("test")).map(f => f.replace(/\.json$/, "")).sort();
+}
+
+/** Stop any running demo and load a project (fresh data, no agents). PM only (checked by the route). */
+export function loadDemo(db: DB, project: string) {
+  if (!/^[a-z0-9-]+$/.test(project) || !loadableProjects().includes(project))
+    throw new BadRequest(`Unknown project "${project}". Available: ${loadableProjects().join(", ")}`);
+  stopDemo(db);
+  const loaded = reset(db, path.join(PROJECTS_DIR, `${project}.json`));
+  return { loaded, ...demoStatus(db) };
+}
+
+export function stopDemo(db: DB) {
+  if (current && !current.finishedAt) finish("stopped");
+  return demoStatus(db);
+}
+
+export function demoStatus(db: DB) {
+  const run = current;
+  const users = db.prepare("SELECT id, name, role, department FROM users").all() as { id: string; name: string; role: string; department: string }[];
+  // Who can be chosen as a real agent for the default (Lumen) demo, from the project file.
+  const lumen = demoProjects().includes("lumen") ? castOf("lumen") : null;
+  const people = lumen ? lumen.spec.people : [];
+  const base = {
+    projects: demoProjects(),
+    available_cast: (lumen?.cast ?? []).map(id => { const p = people.find(x => x.id === id)!; return { id, name: p.name, role: p.role, department: p.department }; }),
+  };
+  if (!run) return { ...base, running: false, project: null, started_at: null, finished_at: null, end_reason: null, cast: [], real: [], progress: null, waiting_for_approval: [], log: [] };
+  const ids = run.taskIds;
+  if (!ids.length) return { ...base, running: false, project: run.project, started_at: run.startedAt, finished_at: run.finishedAt, end_reason: run.endReason, cast: [], real: [], progress: null, waiting_for_approval: [], log: run.log.slice(-20) };
+  const rows = ids.length ? db.prepare(`SELECT id, title, status FROM tasks WHERE id IN (${ids.map(() => "?").join(",")})`).all(...ids) as { id: string; title: string; status: string }[] : [];
+  return {
+    ...base,
+    running: !run.finishedAt, project: run.project, started_at: run.startedAt, finished_at: run.finishedAt, end_reason: run.endReason,
+    cast: run.cast.map(id => users.find(u => u.id === id)).filter(Boolean),
+    real: run.real.map(id => users.find(u => u.id === id)).filter(Boolean),
+    progress: { done: rows.filter(r => r.status === "done").length, total: ids.length },
+    // Milestones of this demo whose tasks are all done and that nobody has approved yet.
+    waiting_for_approval: (db.prepare(`SELECT m.id, m.name AS title FROM milestones m JOIN tasks t ON t.milestone_id = m.id
+      WHERE m.approved_at IS NULL AND m.id IN (SELECT DISTINCT milestone_id FROM tasks WHERE id IN (${ids.map(() => "?").join(",")}))
+      GROUP BY m.id HAVING SUM(t.status != 'done') = 0`).all(...ids) as { id: string; title: string }[]),
+    log: run.log.slice(-20),
+  };
+}
+
+/** For tests: forget any previous run. */
+export function resetDemoState() { if (current && !current.finishedAt) finish("stopped"); current = null; }
